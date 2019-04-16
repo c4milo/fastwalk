@@ -2,12 +2,13 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package fastwalk
+package fastwalk_test
 
 import (
 	"bytes"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -16,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/c4milo/fastwalk"
 )
 
 func formatFileModes(m map[string]os.FileMode) string {
@@ -32,30 +35,46 @@ func formatFileModes(m map[string]os.FileMode) string {
 }
 
 func testFastWalk(t *testing.T, files map[string]string, callback func(path string, typ os.FileMode) error, want map[string]os.FileMode) {
-	testConfig{
-		gopathFiles: files,
-	}.test(t, func(t *goimportTest) {
-		got := map[string]os.FileMode{}
-		var mu sync.Mutex
-		if err := fastWalk(t.gopath, func(path string, typ os.FileMode) error {
-			mu.Lock()
-			defer mu.Unlock()
-			if !strings.HasPrefix(path, t.gopath) {
-				t.Fatalf("bogus prefix on %q, expect %q", path, t.gopath)
-			}
-			key := filepath.ToSlash(strings.TrimPrefix(path, t.gopath))
-			if old, dup := got[key]; dup {
-				t.Fatalf("callback called twice for key %q: %v -> %v", key, old, typ)
-			}
-			got[key] = typ
-			return callback(path, typ)
-		}); err != nil {
-			t.Fatalf("callback returned: %v", err)
+	tempdir, err := ioutil.TempDir("", "test-fast-walk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempdir)
+	for path, contents := range files {
+		file := filepath.Join(tempdir, "/src", path)
+		if err := os.MkdirAll(filepath.Dir(file), 0755); err != nil {
+			t.Fatal(err)
 		}
-		if !reflect.DeepEqual(got, want) {
-			t.Errorf("walk mismatch.\n got:\n%v\nwant:\n%v", formatFileModes(got), formatFileModes(want))
+		var err error
+		if strings.HasPrefix(contents, "LINK:") {
+			err = os.Symlink(strings.TrimPrefix(contents, "LINK:"), file)
+		} else {
+			err = ioutil.WriteFile(file, []byte(contents), 0644)
 		}
-	})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := map[string]os.FileMode{}
+	var mu sync.Mutex
+	if err := fastwalk.Walk(tempdir, func(path string, typ os.FileMode) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if !strings.HasPrefix(path, tempdir) {
+			t.Fatalf("bogus prefix on %q, expect %q", path, tempdir)
+		}
+		key := filepath.ToSlash(strings.TrimPrefix(path, tempdir))
+		if old, dup := got[key]; dup {
+			t.Fatalf("callback called twice for key %q: %v -> %v", key, old, typ)
+		}
+		got[key] = typ
+		return callback(path, typ)
+	}); err != nil {
+		t.Fatalf("callback returned: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("walk mismatch.\n got:\n%v\nwant:\n%v", formatFileModes(got), formatFileModes(want))
+	}
 }
 
 func TestFastWalk_Basic(t *testing.T) {
@@ -77,6 +96,23 @@ func TestFastWalk_Basic(t *testing.T) {
 			"/src/skip":         os.ModeDir,
 			"/src/skip/skip.go": 0,
 		})
+}
+
+func TestFastWalk_LongFileName(t *testing.T) {
+	longFileName := strings.Repeat("x", 255)
+
+	testFastWalk(t, map[string]string{
+		longFileName: "one",
+	},
+		func(path string, typ os.FileMode) error {
+			return nil
+		},
+		map[string]os.FileMode{
+			"":                     os.ModeDir,
+			"/src":                 os.ModeDir,
+			"/src/" + longFileName: 0,
+		},
+	)
 }
 
 func TestFastWalk_Symlink(t *testing.T) {
@@ -126,6 +162,38 @@ func TestFastWalk_SkipDir(t *testing.T) {
 		})
 }
 
+func TestFastWalk_SkipFiles(t *testing.T) {
+	// Directory iteration order is undefined, so there's no way to know
+	// which file to expect until the walk happens. Rather than mess
+	// with the test infrastructure, just mutate want.
+	var mu sync.Mutex
+	want := map[string]os.FileMode{
+		"":              os.ModeDir,
+		"/src":          os.ModeDir,
+		"/src/zzz":      os.ModeDir,
+		"/src/zzz/c.go": 0,
+	}
+
+	testFastWalk(t, map[string]string{
+		"a_skipfiles.go": "a",
+		"b_skipfiles.go": "b",
+		"zzz/c.go":       "c",
+	},
+		func(path string, typ os.FileMode) error {
+			if strings.HasSuffix(path, "_skipfiles.go") {
+				mu.Lock()
+				defer mu.Unlock()
+				want["/src/"+filepath.Base(path)] = 0
+				return fastwalk.SkipFiles
+			}
+			return nil
+		},
+		want)
+	if len(want) != 5 {
+		t.Errorf("saw too many files: wanted 5, got %v (%v)", len(want), want)
+	}
+}
+
 func TestFastWalk_TraverseSymlink(t *testing.T) {
 	switch runtime.GOOS {
 	case "windows", "plan9":
@@ -140,7 +208,7 @@ func TestFastWalk_TraverseSymlink(t *testing.T) {
 	},
 		func(path string, typ os.FileMode) error {
 			if typ == os.ModeSymlink {
-				return traverseLink
+				return fastwalk.TraverseLink
 			}
 			return nil
 		},
@@ -163,7 +231,7 @@ var benchDir = flag.String("benchdir", runtime.GOROOT(), "The directory to scan 
 func BenchmarkFastWalk(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		err := fastWalk(*benchDir, func(path string, typ os.FileMode) error { return nil })
+		err := fastwalk.Walk(*benchDir, func(path string, typ os.FileMode) error { return nil })
 		if err != nil {
 			b.Fatal(err)
 		}
